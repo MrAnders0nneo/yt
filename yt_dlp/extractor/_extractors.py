@@ -1113,12 +1113,13 @@ from .meipai import MeipaiIE
 from .melonvod import MelonVODIE
 from .metacritic import MetacriticIE
 from .mgtv import MGTVIE
-from .microsoftembed import MicrosoftEmbedIE
-from .microsoftstream import MicrosoftStreamIE
-from .microsoftvirtualacademy import (
-    MicrosoftVirtualAcademyCourseIE,
-    MicrosoftVirtualAcademyIE,
+from .microsoftembed import (
+    MicrosoftBuildIE,
+    MicrosoftEmbedIE,
+    MicrosoftLearnIE,
+    MicrosoftMediusIE,
 )
+from .microsoftstream import MicrosoftStreamIE
 from .mildom import (
     MildomClipIE,
     MildomIE,
