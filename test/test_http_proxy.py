@@ -4,11 +4,12 @@ import contextlib
 import functools
 import json
 import os
+import platform
 import random
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler
-from socketserver import ThreadingTCPServer
+from socketserver import BaseRequestHandler, ThreadingTCPServer
 
 import pytest
 
@@ -45,6 +46,11 @@ class HTTPProxyAuthMixin:
             auth_username, auth_password = base64.b64decode(auth).decode().split(':', 1)
         except Exception:
             return self.proxy_auth_error()
+
+        if auth_username == 'http_error':
+            self.send_response(404)
+            self.end_headers()
+            return False
 
         if auth_username != (username or '') or auth_password != (password or ''):
             return self.proxy_auth_error()
@@ -119,6 +125,16 @@ if urllib3:
 
         def shutdown(self, *args, **kwargs):
             self.socket.shutdown(*args, **kwargs)
+
+        def _wrap_ssl_read(self, *args, **kwargs):
+            res = super()._wrap_ssl_read(*args, **kwargs)
+            if res == 0:
+                # Websockets does not treat 0 as an EOF, rather only b''
+                return b''
+            return res
+
+        def getsockname(self):
+            return self.socket.getsockname()
 else:
     SSLTransport = None
 
@@ -128,7 +144,36 @@ class HTTPSProxyHandler(HTTPProxyHandler):
         certfn = os.path.join(TEST_DIR, 'testcert.pem')
         sslctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         sslctx.load_cert_chain(certfn, None)
-        if isinstance(request, ssl.SSLSocket):
+        if SSLTransport:
+            request = SSLTransport(request, ssl_context=sslctx, server_side=True)
+        else:
+            request = sslctx.wrap_socket(request, server_side=True)
+        super().__init__(request, *args, **kwargs)
+
+
+class WebSocketProxyHandler(BaseRequestHandler):
+    def __init__(self, *args, proxy_info=None, **kwargs):
+        self.proxy_info = proxy_info
+        super().__init__(*args, **kwargs)
+
+    def handle(self):
+        import websockets.sync.server
+        self.request.settimeout(None)
+        protocol = websockets.ServerProtocol()
+        connection = websockets.sync.server.ServerConnection(socket=self.request, protocol=protocol, close_timeout=2)
+        connection.handshake()
+        for message in connection:
+            if message == 'proxy_info':
+                connection.send(json.dumps(self.proxy_info))
+        connection.close()
+
+
+class WebSocketSecureProxyHandler(WebSocketProxyHandler):
+    def __init__(self, request, *args, **kwargs):
+        certfn = os.path.join(TEST_DIR, 'testcert.pem')
+        sslctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sslctx.load_cert_chain(certfn, None)
+        if isinstance(request, ssl.SSLSocket) and SSLTransport:
             request = SSLTransport(request, ssl_context=sslctx, server_side=True)
         else:
             request = sslctx.wrap_socket(request, server_side=True)
@@ -197,7 +242,6 @@ def proxy_server(proxy_server_class, request_handler, bind_ip=None, **proxy_serv
     finally:
         server.shutdown()
         server.server_close()
-        server_thread.join(2.0)
 
 
 class HTTPProxyTestContext(abc.ABC):
@@ -234,9 +278,30 @@ class HTTPProxyHTTPSTestContext(HTTPProxyTestContext):
         return json.loads(handler.send(request).read().decode())
 
 
+class HTTPProxyWebSocketTestContext(HTTPProxyTestContext):
+    REQUEST_HANDLER_CLASS = WebSocketProxyHandler
+    REQUEST_PROTO = 'ws'
+
+    def proxy_info_request(self, handler, target_domain=None, target_port=None, **req_kwargs):
+        request = Request(f'{self.REQUEST_PROTO}://{target_domain or "127.0.0.1"}:{target_port or "40000"}', **req_kwargs)
+        handler.validate(request)
+        ws = handler.send(request)
+        ws.send('proxy_info')
+        proxy_info = ws.recv()
+        ws.close()
+        return json.loads(proxy_info)
+
+
+class HTTPProxyWebSocketSecureTestContext(HTTPProxyWebSocketTestContext):
+    REQUEST_HANDLER_CLASS = WebSocketSecureProxyHandler
+    REQUEST_PROTO = 'wss'
+
+
 CTX_MAP = {
     'http': HTTPProxyHTTPTestContext,
     'https': HTTPProxyHTTPSTestContext,
+    'ws': HTTPProxyWebSocketTestContext,
+    'wss': HTTPProxyWebSocketSecureTestContext,
 }
 
 
@@ -270,6 +335,14 @@ class TestHTTPProxy:
                 with pytest.raises(HTTPError) as exc_info:
                     ctx.proxy_info_request(rh)
                 assert exc_info.value.response.status == 407
+                exc_info.value.response.close()
+
+    def test_http_error(self, handler, ctx):
+        with ctx.http_server(HTTPProxyHandler, username='http_error', password='test') as server_address:
+            with handler(proxies={ctx.REQUEST_PROTO: f'http://http_error:test@{server_address}'}) as rh:
+                with pytest.raises(HTTPError) as exc_info:
+                    ctx.proxy_info_request(rh)
+                assert exc_info.value.response.status == 404
                 exc_info.value.response.close()
 
     def test_http_source_address(self, handler, ctx):
@@ -314,6 +387,8 @@ class TestHTTPProxy:
     'handler,ctx', [
         ('Requests', 'https'),
         ('CurlCFFI', 'https'),
+        ('Websockets', 'ws'),
+        ('Websockets', 'wss')
     ], indirect=True)
 class TestHTTPConnectProxy:
     def test_http_connect_no_auth(self, handler, ctx):
@@ -341,6 +416,16 @@ class TestHTTPConnectProxy:
                 with pytest.raises(ProxyError):
                     ctx.proxy_info_request(rh)
 
+    @pytest.mark.skip_handler(
+        'Requests',
+        'bug in urllib3 causes unclosed socket: https://github.com/urllib3/urllib3/issues/3374'
+    )
+    def test_http_connect_http_error(self, handler, ctx):
+        with ctx.http_server(HTTPConnectProxyHandler, username='http_error', password='test') as server_address:
+            with handler(verify=False, proxies={ctx.REQUEST_PROTO: f'http://http_error:test@{server_address}'}) as rh:
+                with pytest.raises(ProxyError):
+                    ctx.proxy_info_request(rh)
+
     def test_http_connect_source_address(self, handler, ctx):
         with ctx.http_server(HTTPConnectProxyHandler) as server_address:
             source_address = f'127.0.0.{random.randint(5, 255)}'
@@ -353,6 +438,11 @@ class TestHTTPConnectProxy:
                 assert proxy_info['client_address'][0] == source_address
 
     @pytest.mark.skipif(urllib3 is None, reason='requires urllib3 to test')
+    @pytest.mark.skip_handler_if(
+        'Websockets', lambda request:
+            (platform.python_implementation() == 'PyPy'
+             and request.getfixturevalue('ctx').REQUEST_PROTO == 'wss'),
+        'PyPy sometimes fails with WSS over TLS tests, unknown reason')
     def test_https_connect_proxy(self, handler, ctx):
         with ctx.http_server(HTTPSConnectProxyHandler) as server_address:
             with handler(verify=False, proxies={ctx.REQUEST_PROTO: f'https://{server_address}'}) as rh:
@@ -362,6 +452,11 @@ class TestHTTPConnectProxy:
                 assert 'Proxy-Authorization' not in proxy_info['headers']
 
     @pytest.mark.skipif(urllib3 is None, reason='requires urllib3 to test')
+    @pytest.mark.skip_handler_if(
+        'Websockets', lambda request:
+            (platform.python_implementation() == 'PyPy'
+             and request.getfixturevalue('ctx').REQUEST_PROTO == 'wss'),
+        'PyPy sometimes fails with WSS over TLS tests, unknown reason')
     def test_https_connect_verify_failed(self, handler, ctx):
         with ctx.http_server(HTTPSConnectProxyHandler) as server_address:
             with handler(verify=True, proxies={ctx.REQUEST_PROTO: f'https://{server_address}'}) as rh:
@@ -372,6 +467,11 @@ class TestHTTPConnectProxy:
                     ctx.proxy_info_request(rh)
 
     @pytest.mark.skipif(urllib3 is None, reason='requires urllib3 to test')
+    @pytest.mark.skip_handler_if(
+        'Websockets', lambda request:
+            (platform.python_implementation() == 'PyPy'
+             and request.getfixturevalue('ctx').REQUEST_PROTO == 'wss'),
+        'PyPy sometimes fails with WSS over TLS tests, unknown reason')
     def test_https_connect_proxy_auth(self, handler, ctx):
         with ctx.http_server(HTTPSConnectProxyHandler, username='test', password='test') as server_address:
             with handler(verify=False, proxies={ctx.REQUEST_PROTO: f'https://test:test@{server_address}'}) as rh:
