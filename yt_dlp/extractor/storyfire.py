@@ -14,8 +14,8 @@ class StoryFireBaseIE(InfoExtractor):
 
     def _call_api(self, path, video_id, resource, query=None):
         return self._download_json(
-            'https://storyfire.com/app/%s/%s' % (path, video_id), video_id,
-            'Downloading %s JSON metadata' % resource, query=query)
+            f'https://storyfire.com/app/{path}/{video_id}', video_id,
+            f'Downloading {resource} JSON metadata', query=query)
 
     def _parse_video(self, video):
         title = video['title']
@@ -69,7 +69,7 @@ class StoryFireIE(StoryFireBaseIE):
         'params': {
             'skip_download': True,
         },
-        'expected_warnings': ['Unable to download JSON metadata']
+        'expected_warnings': ['Unable to download JSON metadata'],
     }
 
     def _real_extract(self, url):

@@ -1,11 +1,8 @@
 import random
 import re
+import urllib.parse
 
 from .common import InfoExtractor
-from ..compat import (
-    compat_str,
-    compat_urlparse,
-)
 from ..utils import (
     ExtractorError,
     encode_data_uri,
@@ -88,7 +85,7 @@ class UstreamIE(InfoExtractor):
                 'type': 'viewer',
                 'appId': app_id_ver[0],
                 'appVersion': app_id_ver[1],
-                'rsid': '%s:%s' % (num_to_hex(rnd(1e8)), num_to_hex(rnd(1e8))),
+                'rsid': f'{num_to_hex(rnd(1e8))}:{num_to_hex(rnd(1e8))}',
                 'rpin': '_rpin.%d' % rnd(1e15),
                 'referrer': url,
                 'media': video_id,
@@ -98,7 +95,7 @@ class UstreamIE(InfoExtractor):
         connection_id = conn_info[0]['args'][0]['connectionId']
 
         return self._download_json(
-            'http://%s/1/ustream?connectionId=%s' % (host, connection_id),
+            f'http://{host}/1/ustream?connectionId={connection_id}',
             video_id, note='Downloading stream info' + extra_note)
 
     def _get_streams(self, url, video_id, app_id_ver):
@@ -113,7 +110,7 @@ class UstreamIE(InfoExtractor):
 
     def _parse_segmented_mp4(self, dash_stream_info):
         def resolve_dash_template(template, idx, chunk_hash):
-            return template.replace('%', compat_str(idx), 1).replace('%', chunk_hash)
+            return template.replace('%', str(idx), 1).replace('%', chunk_hash)
 
         formats = []
         for stream in dash_stream_info['streams']:
@@ -121,13 +118,13 @@ class UstreamIE(InfoExtractor):
             provider = dash_stream_info['providers'][0]
             fragments = [{
                 'url': resolve_dash_template(
-                    provider['url'] + stream['initUrl'], 0, dash_stream_info['hashes']['0'])
+                    provider['url'] + stream['initUrl'], 0, dash_stream_info['hashes']['0']),
             }]
             for idx in range(dash_stream_info['videoLength'] // dash_stream_info['chunkTime']):
                 fragments.append({
                     'url': resolve_dash_template(
                         provider['url'] + stream['segmentUrl'], idx,
-                        dash_stream_info['hashes'][compat_str(idx // 10 * 10)])
+                        dash_stream_info['hashes'][str(idx // 10 * 10)]),
                 })
             content_type = stream['contentType']
             kind = content_type.split('/')[0]
@@ -173,16 +170,16 @@ class UstreamIE(InfoExtractor):
                 r'ustream\.vars\.offAirContentVideoIds=([^;]+);', webpage,
                 'content video IDs'), video_id)
             return self.playlist_result(
-                map(lambda u: self.url_result('http://www.ustream.tv/recorded/' + u, 'Ustream'), content_video_ids),
+                (self.url_result('http://www.ustream.tv/recorded/' + u, 'Ustream') for u in content_video_ids),
                 video_id)
 
         params = self._download_json(
-            'https://api.ustream.tv/videos/%s.json' % video_id, video_id)
+            f'https://api.ustream.tv/videos/{video_id}.json', video_id)
 
         error = params.get('error')
         if error:
             raise ExtractorError(
-                '%s returned error: %s' % (self.IE_NAME, error), expected=True)
+                f'{self.IE_NAME} returned error: {error}', expected=True)
 
         video = params['video']
 
@@ -255,11 +252,11 @@ class UstreamChannelIE(InfoExtractor):
         channel_id = self._html_search_meta('ustream:channel_id', webpage)
 
         BASE = 'http://www.ustream.tv'
-        next_url = '/ajax/socialstream/videos/%s/1.json' % channel_id
+        next_url = f'/ajax/socialstream/videos/{channel_id}/1.json'
         video_ids = []
         while next_url:
             reply = self._download_json(
-                compat_urlparse.urljoin(BASE, next_url), display_id,
+                urllib.parse.urljoin(BASE, next_url), display_id,
                 note='Downloading video information (next: %d)' % (len(video_ids) + 1))
             video_ids.extend(re.findall(r'data-content-id="(\d.*)"', reply['data']))
             next_url = reply['nextUrl']
